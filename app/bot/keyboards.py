@@ -2,7 +2,6 @@
 Keyboards Module - لوحات المفاتيح
 جميع لوحات المفاتيح الديناميكية والعامة للبوت
 """
-from functools import lru_cache
 from typing import List, Optional
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -72,7 +71,6 @@ def get_category_keyboard(categories: List[BookCategory] = None) -> InlineKeyboa
     builder.adjust(2)
     return builder.as_markup()
 
-@lru_cache(maxsize=1)
 def _load_active_categories() -> List[BookCategory]:
     db = SessionLocal()
     try:
