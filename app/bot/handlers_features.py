@@ -149,7 +149,7 @@ class ForceJoinMiddleware(BaseMiddleware):
 
             # السماح بأوامر المساعدة الأساسية بدون فحص اشتراك
             if isinstance(event, Message) and event.text and event.text.startswith('/'):
-                if event.text in ['/start', '/help', '/cancel']:
+                if event.text in ['/cancel']:
                     return await handler(event, data)
 
             channel_service = ChannelService(db)
@@ -986,7 +986,17 @@ async def callback_download(callback: CallbackQuery):
             await callback.answer("الكتاب غير موجود", show_alert=True)
             return
 
-        if not book.file_path or not os.path.exists(book.file_path):
+        resolved_path = book.file_path
+        if resolved_path and not os.path.isabs(resolved_path):
+            candidate = os.path.abspath(resolved_path)
+            if os.path.exists(candidate):
+                resolved_path = candidate
+            else:
+                candidate = os.path.abspath(os.path.join(settings.upload_folder, os.path.basename(resolved_path)))
+                if os.path.exists(candidate):
+                    resolved_path = candidate
+
+        if not resolved_path or not os.path.exists(resolved_path):
             await callback.answer("الكتاب غير متاح للتحميل حالياً", show_alert=True)
             return
 
@@ -1016,7 +1026,7 @@ async def callback_download(callback: CallbackQuery):
         user_service.increment_downloads(callback.from_user.id)
 
         # إرسال الملف
-        with open(book.file_path, 'rb') as file:
+        with open(resolved_path, 'rb') as file:
             await callback.message.answer_document(
                 document=file,
                 caption=f"📥 {book.title}"
@@ -1237,8 +1247,50 @@ async def process_book_description(message: Message, state: FSMContext):
     if desc == "/skip":
         desc = None
     await state.update_data(description=desc)
-    await message.answer("📂 أرسل ملف الكتاب (PDF أو EPUB):")
+
+    db = SessionLocal()
+    try:
+        category_service = CategoryService(db)
+        categories = category_service.list_all(active_only=True)
+    finally:
+        db.close()
+
+    if not categories:
+        await message.answer("📂 أرسل ملف الكتاب (PDF أو EPUB):")
+        await state.set_state(AdminStates.waiting_book_file)
+        return
+
+    keyboard_rows = []
+    for cat in categories[:20]:
+        keyboard_rows.append([InlineKeyboardButton(text=cat.name, callback_data=f"bookcat_{cat.id}")])
+    keyboard_rows.append([InlineKeyboardButton(text="⏭️ تخطي القسم", callback_data="bookcat_skip")])
+
+    await message.answer(
+        "📁 اختر القسم المناسب للكتاب:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    )
+    await state.set_state(AdminStates.waiting_book_category)
+
+
+@router.callback_query(F.data.startswith("bookcat_"))
+async def callback_book_category(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+
+    category_id = None
+    if callback.data != "bookcat_skip":
+        try:
+            category_id = int(callback.data.split("_", 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("القسم غير صالح", show_alert=True)
+            return
+
+    await state.update_data(category_id=category_id)
+    await callback.message.edit_text("📂 أرسل ملف الكتاب (PDF أو EPUB):")
     await state.set_state(AdminStates.waiting_book_file)
+    await callback.answer()
+
 
 @router.message(AdminStates.waiting_book_file, F.document)
 async def process_book_file(message: Message, state: FSMContext, bot: Bot):
@@ -1248,58 +1300,57 @@ async def process_book_file(message: Message, state: FSMContext, bot: Bot):
     title = data.get("title")
     author_name = data.get("author")
     description = data.get("description")
+    category_id = data.get("category_id")
     doc = message.document
-    
-    # التحقق من نوع الملف
+
     allowed_extensions = ['.pdf', '.epub', '.fb2', '.mobi', '.txt']
     file_name = doc.file_name.lower()
     if not any(file_name.endswith(ext) for ext in allowed_extensions):
         await message.answer("⚠️ نوع الملف غير مدعوم. يرجى إرسال ملف PDF أو EPUB أو FB2 أو MOBI أو TXT فقط.")
         return
-    
-    # التحقق من حجم الملف
-    max_size = 100 * 1024 * 1024  # 100MB
+
+    max_size = 100 * 1024 * 1024
     if doc.file_size and doc.file_size > max_size:
         await message.answer(f"⚠️ حجم الملف كبير جداً. الحد الأقصى هو {max_size // (1024*1024)}MB.")
         return
-    
-    # تأكد من وجود مجلد uploads
-    os.makedirs("uploads", exist_ok=True)
-    file_path = f"uploads/{doc.file_id}_{doc.file_name}"
-    
+
+    upload_root = os.path.abspath(settings.upload_folder)
+    os.makedirs(upload_root, exist_ok=True)
+    file_path = os.path.abspath(os.path.join(upload_root, f"{doc.file_id}_{doc.file_name}"))
+
     try:
         await bot.download(doc, destination=file_path)
     except Exception as e:
         logging.error(f"Error downloading file: {e}")
         await message.answer("⚠️ فشل في تحميل الملف. حاول مرة أخرى.")
         return
-    
+
     db = SessionLocal()
     try:
-        # التعامل مع المؤلف
         author_service = AuthorService(db)
         author = author_service.get_by_name(author_name)
         if not author:
             author = author_service.create(name=author_name)
+
         book_service = BookService(db)
-        book = book_service.create(
+        book = book_service.create_book(
             title=title,
             author_id=author.id,
             description=description,
+            category_id=category_id,
             file_path=file_path,
-            status=BookStatus.PENDING
+            status=BookStatus.ACTIVE
         )
-        await message.answer(f"✅ تم رفع الكتاب '{book.title}' بنجاح، وهو ينتظر المراجعة.")
+        await message.answer(f"✅ تم رفع الكتاب '{book.title}' بنجاح وأصبح متاحاً للعرض والتحميل.")
     except Exception as e:
         logging.error(f"Error saving book: {e}")
         await message.answer(f"⚠️ حدث خطأ أثناء حفظ الكتاب: {e}")
-        # حذف الملف إذا فشل الحفظ
         if os.path.exists(file_path):
             os.remove(file_path)
     finally:
         db.close()
         await state.clear()
-    # العودة إلى لوحة إدارة الكتب
+
     await message.answer("📚 تم تسجيل الكتاب بنجاح.", reply_markup=get_admin_books_keyboard())
 
 # ==========================================
@@ -1905,7 +1956,32 @@ async def callback_my_stats(callback: CallbackQuery):
 @router.callback_query(F.data == "search_text")
 async def callback_search_text(callback: CallbackQuery, state: FSMContext):
     """البحث النصي"""
+    await state.update_data(search_mode="text")
     await callback.message.edit_text("🔍 أدخل نص البحث:")
+    await state.set_state(AdminStates.waiting_search)
+
+
+@router.callback_query(F.data == "search_ai")
+async def callback_search_ai(callback: CallbackQuery, state: FSMContext):
+    """البحث الذكي"""
+    await state.update_data(search_mode="ai")
+    await callback.message.edit_text("🤖 أدخل ما تريد البحث عنه ذكيًا:")
+    await state.set_state(AdminStates.waiting_search)
+
+
+@router.callback_query(F.data == "search_category")
+async def callback_search_category(callback: CallbackQuery, state: FSMContext):
+    """البحث حسب القسم"""
+    await state.update_data(search_mode="category")
+    await callback.message.edit_text("📁 أدخل اسم القسم:")
+    await state.set_state(AdminStates.waiting_search)
+
+
+@router.callback_query(F.data == "search_author")
+async def callback_search_author(callback: CallbackQuery, state: FSMContext):
+    """البحث حسب المؤلف"""
+    await state.update_data(search_mode="author")
+    await callback.message.edit_text("✍️ أدخل اسم المؤلف:")
     await state.set_state(AdminStates.waiting_search)
 
 
@@ -1913,18 +1989,30 @@ async def callback_search_text(callback: CallbackQuery, state: FSMContext):
 async def handle_search(message: Message, state: FSMContext):
     """معالجة البحث"""
     query = message.text.strip()
+    data = await state.get_data()
+    search_mode = data.get("search_mode", "text")
 
     db = SessionLocal()
     try:
         search_service = SearchService(db)
-        books, authors = search_service.text_search(query, limit=10)
+        books = []
+        authors = []
+
+        if search_mode == "author":
+            books = search_service.search_by_author(query, limit=10)
+        elif search_mode == "category":
+            books = search_service.search_by_category(query, limit=10)
+        else:
+            try:
+                books, authors = search_service.text_search(query, limit=10)
+            except Exception:
+                books, authors = search_service.text_search(query, limit=10)
 
         if not books and not authors:
             await message.answer(f"لم يتم العثور على نتائج لـ: {query}")
             return
 
         text = f"🔍 نتائج البحث عن: {query}\n\n"
-
         if books:
             text += "📚 الكتب:\n"
             for book in books[:5]:
@@ -1935,7 +2023,7 @@ async def handle_search(message: Message, state: FSMContext):
             for auth in authors[:5]:
                 text += f"• {auth.name}\n"
 
-        keyboard = get_books_list_keyboard(books) if books else None
+        keyboard = get_books_list_keyboard(books[:10]) if books else None
         await message.answer(text, reply_markup=keyboard)
     finally:
         db.close()
@@ -2448,3 +2536,85 @@ async def callback_admin_challenges_main(callback: CallbackQuery):
     if not is_owner(callback.from_user.id): return
     from app.bot.keyboards import get_admin_challenges_keyboard
     await callback.message.edit_text("🏆 إدارة التحديات", reply_markup=get_admin_challenges_keyboard())
+
+@router.callback_query(F.data == "contact_support")
+async def callback_contact_support(callback: CallbackQuery):
+    """التواصل مع الدعم"""
+    support_text = '📞 الدعم الفني\n\n'
+    if settings.telegram_admin_id:
+        try:
+            admin_chat = await callback.bot.get_chat(settings.telegram_admin_id)
+            if admin_chat.username:
+                support_text += f"راسل الدعم مباشرة عبر: @{admin_chat.username}"
+            else:
+                support_text += f"راسل مالك البوت عبر المعرف: {settings.telegram_admin_id}"
+        except Exception:
+            support_text += f"راسل مالك البوت عبر المعرف: {settings.telegram_admin_id}"
+    else:
+        support_text += "لا يوجد معرف دعم مضبوط حالياً."
+
+    await callback.message.edit_text(support_text, reply_markup=get_settings_keyboard("ar"))
+
+
+@router.callback_query(F.data == "admin_market_listings")
+async def callback_admin_market_listings(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🏪 إدارة السوق - قائمة المعروضات\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_market_auctions")
+async def callback_admin_market_auctions(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🏪 إدارة السوق - المزادات\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_market_settings")
+async def callback_admin_market_settings(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🏪 إدارة السوق - الإعدادات\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_ch_add")
+async def callback_admin_ch_add(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🏆 إضافة تحدٍ جديد\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_badges")
+async def callback_admin_badges(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🏆 إدارة الشارات\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_security_events")
+async def callback_admin_security_events(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🔒 سجلات الأمان والتدقيق\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_referral_leaderboard")
+async def callback_admin_referral_leaderboard(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🎯 لوحة أفضل المحيلين\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
+
+
+@router.callback_query(F.data == "admin_referral_settings")
+async def callback_admin_referral_settings(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("غير مصرح لك", show_alert=True)
+        return
+    await callback.message.edit_text('🎯 إعدادات الإحالة\n\n(قيد التطوير)', reply_markup=get_back_to_admin_keyboard())
